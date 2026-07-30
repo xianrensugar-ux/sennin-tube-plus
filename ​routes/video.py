@@ -1,15 +1,14 @@
 import asyncio
 import json
-import random
 from datetime import datetime
 from fastapi import APIRouter, Request, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, JSONResponse
 from fastapi.templating import Jinja2Templates
 import httpx
 
-from config import INVIDIOUS_INSTANCES, client_session
+from config import INVIDIOUS_INSTANCES, PIPED_INSTANCES, COBALT_INSTANCES, client_session
 from utils.cache import search_cache
-from utils.fetcher import fetch_invidious, fetch_video_smart
+from utils.fetcher import fetch_invidious, fetch_video_ultra, fetch_cobalt_stream
 
 router = APIRouter()
 templates = Jinja2Templates(directory="templates")
@@ -18,7 +17,7 @@ templates.env.add_extension('jinja2.ext.do')
 @router.get("/search", response_class=HTMLResponse)
 async def search(request: Request, q: str = Query(...), page: int = 1, type: str = "video", force_instance: str = Query(None)):
     cache_key = f"search:{q}:{type}:{page}"
-    cached_results = search_cache.get(cache_key)
+    cached_results = await search_cache.get(cache_key)
     if cached_results:
         return templates.TemplateResponse("search.html", {
             "request": request, "query": q, "results": cached_results, "type": type, "page": page
@@ -48,8 +47,8 @@ async def search(request: Request, q: str = Query(...), page: int = 1, type: str
             "videoCount": item.get("videoCount")
         } for item in data]
 
-        search_cache.set(cache_key, results)
-            
+        await search_cache.set(cache_key, results)
+
         return templates.TemplateResponse("search.html", {
             "request": request, "query": q, "results": results, "type": type, "page": page
         })
@@ -61,14 +60,15 @@ async def search(request: Request, q: str = Query(...), page: int = 1, type: str
 @router.get("/watch", response_class=HTMLResponse)
 async def watch(request: Request, v: str = Query(...), force_instance: str = Query(None)):
     try:
-        video_task = fetch_video_smart(v, force_instance=force_instance)
+        # 動画本体とコメントを非同期並列で取得
+        video_task = fetch_video_ultra(v, force_instance=force_instance)
         comment_task = fetch_invidious(f"/comments/{v}", force_instance=force_instance)
-        
+
         video_data, comment_data = await asyncio.gather(video_task, comment_task, return_exceptions=True)
 
-        if isinstance(video_data, Exception): 
+        if isinstance(video_data, Exception):
             raise video_data
-        
+
         adaptive = video_data.get("adaptiveFormats", [])
         
         audio_url = None
@@ -81,14 +81,14 @@ async def watch(request: Request, v: str = Query(...), force_instance: str = Que
             audio_url = next((f.get("url") for f in adaptive if "audio" in f.get("type", "")), None)
 
         format_streams = video_data.get("formatStreams", [])
-        
+
         stream_urls = [{
             "url": fmt.get("url"),
             "resolution": fmt.get("qualityLabel"),
             "format": "mp4/mixed",
             "audioUrl": ""
         } for fmt in format_streams]
-        
+
         stream_urls.extend({
             "url": fmt.get("url"),
             "resolution": fmt.get("qualityLabel"),
@@ -127,6 +127,7 @@ async def watch(request: Request, v: str = Query(...), force_instance: str = Que
             "youtube_url": f"https://www.youtube.com/watch?v={v}"
         })
 
+        # Cookie 履歴更新
         try:
             history_json = request.cookies.get("history", "[]")
             history = json.loads(history_json)
@@ -148,28 +149,47 @@ async def watch(request: Request, v: str = Query(...), force_instance: str = Que
     except Exception:
         return templates.TemplateResponse("apiallerror.html", {"request": request, "instances": INVIDIOUS_INSTANCES})
 
+# 新機能: Cobalt API ダイレクトダウンロード/高画質ストリームエンドポイント
+@router.get("/api/cobalt/{v}")
+async def cobalt_api_endpoint(v: str):
+    data = await fetch_cobalt_stream(v)
+    if data:
+        return JSONResponse(content=data)
+    return JSONResponse(content={"error": "Cobalt extraction failed"}, status_code=500)
+
 @router.get("/shorts/{v}", response_class=HTMLResponse)
 async def shorts_player(request: Request, v: str, force_instance: str = Query(None)):
     return await watch(request, v=v, force_instance=force_instance)
 
 @router.get("/suggest")
 async def suggest(keyword: str):
-    instances = list(INVIDIOUS_INSTANCES)
-    random.shuffle(instances)
-    
-    async def fetch_sugg(inst):
-        url = f"{inst.rstrip('/')}/api/v1/search/suggestions"
-        resp = await client_session.get(url, params={"q": keyword}, timeout=1.5)
+    """YouTube公式補完API + Invidious の並列フォールバックサジェスト"""
+    # 1. YouTube 公式 Suggest API (最速)
+    try:
+        yt_suggest_url = f"https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&q={keyword}"
+        resp = await client_session.get(yt_suggest_url, timeout=1.2)
         if resp.status_code == 200:
-            return resp.json().get("suggestions", [])
-        raise Exception()
+            # 形式: window.google.ac.h(["q",[["sugg1",0],["sugg2",0]]])
+            text = resp.text
+            start = text.find("(") + 1
+            end = text.rfind(")")
+            data = json.loads(text[start:end])
+            return [item[0] for item in data[1]]
+    except Exception:
+        pass
 
-    tasks = [asyncio.create_task(fetch_sugg(inst)) for inst in instances[:3]]
+    # 2. Invidious 並列フォールバック
+    urls = [f"{inst.rstrip('/')}/api/v1/search/suggestions" for inst in INVIDIOUS_INSTANCES[:3]]
+    tasks = [asyncio.create_task(client_session.get(u, params={"q": keyword})) for u in urls]
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for t in pending: t.cancel()
     for t in done:
-        try: return t.result()
-        except Exception: continue
+        try:
+            r = t.result()
+            if r.status_code == 200:
+                return r.json().get("suggestions", [])
+        except Exception:
+            continue
     return []
 
 @router.get("/proxy/thumb")
