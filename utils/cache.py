@@ -1,21 +1,27 @@
 import time
+import asyncio
 from typing import Dict, Any, Optional
 
-class SimpleTTLCache:
+class AsyncTTLCache:
     def __init__(self, ttl: int = 300):
         self.ttl = ttl
         self.cache: Dict[str, tuple[float, Any]] = {}
+        self._lock = asyncio.Lock()
 
-    def get(self, key: str) -> Optional[Any]:
-        if key in self.cache:
-            created_at, value = self.cache[key]
-            if time.time() - created_at < self.ttl:
-                return value
-            del self.cache[key]
-        return None
+    async def get(self, key: str) -> Optional[Any]:
+        async with self._lock:
+            if key in self.cache:
+                created_at, value = self.cache[key]
+                if time.time() - created_at < self.ttl:
+                    return value
+                del self.cache[key]
+            return None
 
-    def set(self, key: str, value: Any):
-        self.cache[key] = (time.time(), value)
+    async def set(self, key: str, value: Any):
+        async with self._lock:
+            self.cache[key] = (time.time(), value)
 
-search_cache = SimpleTTLCache(ttl=300)
-video_cache = SimpleTTLCache(ttl=600)
+# グローバルキャッシュ定義
+search_cache = AsyncTTLCache(ttl=300)   # 5分
+video_cache = AsyncTTLCache(ttl=1200)   # 20分
+channel_cache = AsyncTTLCache(ttl=1800) # 30分
